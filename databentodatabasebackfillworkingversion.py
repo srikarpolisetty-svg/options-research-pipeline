@@ -14,6 +14,13 @@ import shutil
 
 
 from databasefunctions import get_sp500_symbols
+from policy.expiration import (
+    LOOKAHEAD_DAYS_DEFAULT,
+    find_first_eligible_friday,
+    has_any_eligible_weekly_friday,
+    is_third_friday as policy_is_third_friday,
+)
+from policy.strikes import build_strike_map
 
 client = db.Historical(DATABENTO_API_KEY)
 
@@ -61,23 +68,27 @@ def ensure_table():
     try:
         con.execute("""
             CREATE TABLE IF NOT EXISTS option_snapshots_raw (
-                snapshot_id TEXT,
                 timestamp TIMESTAMP,
-                symbol TEXT,
+                parent_symbol TEXT,
                 underlying_price DOUBLE,
                 strike DOUBLE,
-                call_put TEXT,
+                side TEXT,
                 days_to_expiry INTEGER,
                 expiration_date DATE,
-                moneyness_bucket TEXT,
-                bid DOUBLE,
-                ask DOUBLE,
+                grouping TEXT,
                 mid DOUBLE,
-                volume INTEGER,
-                open_interest INTEGER,
                 iv DOUBLE,
-                spread DOUBLE,
-                spread_pct DOUBLE,
+                time_decay_bucket TEXT
+            );
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS rolling_volume_history (
+                timestamp TIMESTAMP,
+                parent_symbol TEXT,
+                side TEXT,
+                days_to_expiry INTEGER,
+                grouping TEXT,
+                rolling_volume_10m INTEGER,
                 time_decay_bucket TEXT
             );
         """)
@@ -109,28 +120,20 @@ def get_closest_strike(target: float, strikes: list[float]) -> float:
 
 
 def is_third_friday(d):
-    return d.weekday() == 4 and (15 <= d.day <= 21)
+    return policy_is_third_friday(d)
 
 
 def has_any_weekly_expiration(expirations: list[str]) -> bool:
-    # True if any Friday expiry that is NOT the 3rd Friday (i.e., a weekly)
-    for exp in expirations:
-        d = datetime.strptime(exp, "%Y%m%d").date()
-        if d.weekday() == 4 and not is_third_friday(d):
-            return True
-    return False
+    return has_any_eligible_weekly_friday(expirations, exclude_third_friday=True)
 
 
 def get_friday_within_4_days(expirations: list[str], now_date):
-    for exp in sorted(expirations):
-        d = datetime.strptime(exp, "%Y%m%d").date()
-        if (
-            d.weekday() == 4 and
-            0 <= (d - now_date).days <= 4 and
-            not is_third_friday(d)
-        ):
-            return exp
-    return None
+    return find_first_eligible_friday(
+        expirations,
+        now_date,
+        lookahead_days=LOOKAHEAD_DAYS_DEFAULT,
+        exclude_third_friday=True,
+    )
 
 
 # ---------- UNDERLYING ----------
@@ -138,7 +141,7 @@ def fetch_last_days(symbol: str, days: int):
     end = db_end_utc_day()
     start = end - timedelta(days=days)
 
-    df = yf.download(symbol, start=start, end=end, interval="5m", progress=False)
+    df = yf.download(symbol, start=start, end=end, interval="1m", progress=False)
     if df is None or df.empty:
         return df
 
@@ -171,24 +174,46 @@ def build_def_map(df_defs: pd.DataFrame) -> dict[tuple[float, str, datetime.date
 
 
 def build_needed_raw_symbols_from_map(
-    data_10m: pd.DataFrame,
+    data_1m: pd.DataFrame,
     def_map: dict[tuple[float, str, datetime.date], str],
     strikes: list[float],
     expirations: list[str],
 ) -> list[str]:
     """
-    Pre-pass over your 10m timestamps using SAME selection logic (ATM/±1.5/±3.5 + weekly expiry within 4 days).
+    Pre-pass over your intraday timestamps using the same selection logic.
     Uses def_map for fast (strike, side, exp_date) -> raw_symbol.
     """
-    if data_10m is None or data_10m.empty:
+    if data_1m is None or data_1m.empty:
         return []
 
     needed: set[str] = set()
+    daily_leg_map = build_daily_leg_map(data_1m, strikes, expirations)
 
-    for ts, row in data_10m.iterrows():
-        underlying_price = float(row["Close"])
+    for exp_date, _dte, strike_sides in daily_leg_map.values():
+        for strike, side in strike_sides:
+            rs = def_map.get((float(strike), side, exp_date))
+            if rs:
+                needed.add(rs)
+
+    return sorted(needed)
+
+
+def build_daily_leg_map(
+    data_1m: pd.DataFrame,
+    strikes: list[float],
+    expirations: list[str],
+) -> dict[datetime.date, tuple[datetime.date, int, list[tuple[float, str]]]]:
+    if data_1m is None or data_1m.empty:
+        return {}
+
+    daily_leg_map = {}
+
+    for ts, row in data_1m.iterrows():
         now_date = ts.date()
+        if now_date in daily_leg_map:
+            continue
 
+        underlying_price = float(row["Close"])
         exp = get_friday_within_4_days(expirations, now_date)
         if exp is None:
             continue
@@ -198,24 +223,21 @@ def build_needed_raw_symbols_from_map(
         if dte <= 0:
             continue
 
-        atm = get_closest_strike(underlying_price, strikes)
-        c1 = get_closest_strike(underlying_price * 1.015, strikes)
-        p1 = get_closest_strike(underlying_price * 0.985, strikes)
-        c2 = get_closest_strike(underlying_price * 1.035, strikes)
-        p2 = get_closest_strike(underlying_price * 0.965, strikes)
+        strike_map = build_strike_map(float(underlying_price), strikes)
+        atm = strike_map["ATM"]
+        c1 = strike_map["C1"]
+        p1 = strike_map["P1"]
+        c2 = strike_map["C2"]
+        p2 = strike_map["P2"]
 
         strike_sides = [
             (atm, "C"), (atm, "P"),
             (c1, "C"), (p1, "P"),
             (c2, "C"), (p2, "P"),
         ]
+        daily_leg_map[now_date] = (exp_date, dte, strike_sides)
 
-        for strike, side in strike_sides:
-            rs = def_map.get((float(strike), side, exp_date))
-            if rs:
-                needed.add(rs)
-
-    return sorted(needed)
+    return daily_leg_map
 
 
 def get_contract_data_from_dfs_fast(
@@ -269,7 +291,7 @@ def get_contract_data_from_dfs_fast(
 
         g_trd = trd_groups.get(rs)
         if g_trd is not None and not g_trd.empty and "size" in g_trd.columns and trd_tcol:
-            mask = (g_trd[trd_tcol] >= ts - pd.Timedelta(minutes=5)) & (g_trd[trd_tcol] <= ts + pd.Timedelta(minutes=5))
+            mask = (g_trd[trd_tcol] >= ts - pd.Timedelta(minutes=10)) & (g_trd[trd_tcol] <= ts)
             volume = float(g_trd.loc[mask, "size"].sum())
         else:
             volume = 0.0
@@ -433,27 +455,35 @@ def batch_get_df_chunked(
 
 # ---------- HELPERS ----------
 def append_row(
-    results, snapshot_id, ts, symbol, underlying_price, days_till_expiry, exp_date,
-    time_decay_bucket, strike, bucket, side, bid, ask, mid, vol, oi, iv, spread, spread_pct
+    results, ts, parent_symbol, underlying_price, strike, side, days_till_expiry,
+    exp_date, grouping, mid, iv, time_decay_bucket
 ):
     results.append({
-        "snapshot_id": snapshot_id,
         "timestamp": ts,
-        "symbol": symbol,
+        "parent_symbol": parent_symbol,
         "underlying_price": underlying_price,
         "strike": strike,
-        "call_put": side,
+        "side": side,
         "days_to_expiry": days_till_expiry,
         "expiration_date": exp_date,
-        "moneyness_bucket": bucket,
-        "bid": bid,
-        "ask": ask,
+        "grouping": grouping,
         "mid": mid,
-        "volume": int(vol) if vol is not None else 0,
-        "open_interest": int(oi) if oi is not None else None,
         "iv": iv,
-        "spread": spread,
-        "spread_pct": spread_pct,
+        "time_decay_bucket": time_decay_bucket,
+    })
+
+
+def append_volume_row(
+    results, ts, parent_symbol, side, days_till_expiry,
+    grouping, rolling_volume_10m, time_decay_bucket
+):
+    results.append({
+        "timestamp": ts,
+        "parent_symbol": parent_symbol,
+        "side": side,
+        "days_to_expiry": days_till_expiry,
+        "grouping": grouping,
+        "rolling_volume_10m": int(rolling_volume_10m) if rolling_volume_10m is not None else 0,
         "time_decay_bucket": time_decay_bucket,
     })
 
@@ -494,7 +524,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
     start = end - timedelta(days=days_back)
 
     # ---------- PHASE 1A: underlying per symbol (still per-symbol; unavoidable) ----------
-    under_10m: dict[str, pd.DataFrame] = {}
+    under_1m: dict[str, pd.DataFrame] = {}
 
     for symbol in symbols:
         data = fetch_last_days(symbol, days_back)
@@ -506,18 +536,18 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
             data.columns = data.columns.get_level_values(0)
 
         data.index = pd.to_datetime(data.index, utc=True, errors="coerce")
-        data_10m = data.resample("10min").last().dropna()
-        if data_10m.empty:
-            print(f"⏭️ {symbol}: no 10m bars")
+        data_1m = data.resample("1min").last().dropna()
+        if data_1m.empty:
+            print(f"⏭️ {symbol}: no 1m bars")
             continue
 
-        under_10m[symbol] = data_10m
+        under_1m[symbol] = data_1m
 
-    if not under_10m:
+    if not under_1m:
         print("[INFO] no symbols with valid underlying data")
         return
 
-    eligible_syms = sorted(under_10m.keys())
+    eligible_syms = sorted(under_1m.keys())
     print(f"[INFO] underlying ok: {len(eligible_syms)} symbol(s). batching definitions...")
 
     # ---------- PHASE 1B: definitions in chunks; build plans + union raw_symbols ----------
@@ -560,7 +590,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                         parent_col = detect_parent_col(df2)
                         for parent_val, g in df2.groupby(parent_col):
                             sym = parent_to_underlying(parent_val)
-                            if sym not in under_10m:
+                            if sym not in under_1m:
                                 continue
                             df_defs = g.copy()
                             if df_defs.empty:
@@ -577,7 +607,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                             def_map = build_def_map(df_defs)
 
                             raw_needed = build_needed_raw_symbols_from_map(
-                                data_10m=under_10m[sym],
+                                data_1m=under_1m[sym],
                                 def_map=def_map,
                                 strikes=strikes,
                                 expirations=expirations,
@@ -587,7 +617,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                                 continue
 
                             plans[sym] = {
-                                "data_10m": under_10m[sym],
+                                "data_1m": under_1m[sym],
                                 "strikes": strikes,
                                 "expirations": expirations,
                                 "def_map": def_map,
@@ -607,7 +637,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
         for parent_val, g in df_defs_all.groupby(parent_col):
             sym = parent_to_underlying(parent_val)
 
-            if sym not in under_10m:
+            if sym not in under_1m:
                 continue
 
             df_defs = g.copy()
@@ -626,7 +656,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
             def_map = build_def_map(df_defs)
 
             raw_needed = build_needed_raw_symbols_from_map(
-                data_10m=under_10m[sym],
+                data_1m=under_1m[sym],
                 def_map=def_map,
                 strikes=strikes,
                 expirations=expirations,
@@ -636,7 +666,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 continue
 
             plans[sym] = {
-                "data_10m": under_10m[sym],
+                "data_1m": under_1m[sym],
                 "strikes": strikes,
                 "expirations": expirations,
                 "def_map": def_map,
@@ -657,7 +687,7 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
 
     mkt_df_all = batch_get_df_chunked(
         dataset="OPRA.PILLAR",
-        schema="cbbo-1m",
+        schema="cbbo-1s",
         symbols=union_raw_list,
         start=start,
         end=end_batch,
@@ -726,15 +756,17 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
 
     # ---------- PHASE 3: per symbol compute using global dfs ----------
     for symbol, plan in plans.items():
-        data_10m = plan["data_10m"]
+        data_1m = plan["data_1m"]
         strikes = plan["strikes"]
         expirations = plan["expirations"]
         def_map = plan["def_map"]
         raw_needed = plan["raw_needed"]
+        daily_leg_map = build_daily_leg_map(data_1m, strikes, expirations)
 
-        results = []
+        snapshot_results = []
+        volume_results = []
 
-        for window_start, window_df in data_10m.groupby(pd.Grouper(freq="1h")):
+        for window_start, window_df in data_1m.groupby(pd.Grouper(freq="1h")):
             if window_df.empty:
                 continue
             window_end = window_start + pd.Timedelta(hours=1)
@@ -742,29 +774,11 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
             per_ts = {}
             for ts, row in window_df.iterrows():
                 underlying_price = float(row["Close"])
-
-                atm_strike = get_closest_strike(underlying_price, strikes)
-                c1 = get_closest_strike(underlying_price * 1.015, strikes)
-                p1 = get_closest_strike(underlying_price * 0.985, strikes)
-                c2 = get_closest_strike(underlying_price * 1.035, strikes)
-                p2 = get_closest_strike(underlying_price * 0.965, strikes)
-
-                now_date = ts.date()
-                exp = get_friday_within_4_days(expirations, now_date)
-                if exp is None:
+                daily_legs = daily_leg_map.get(ts.date())
+                if daily_legs is None:
                     continue
 
-                exp_date = datetime.strptime(exp, "%Y%m%d").date()
-                days_till_expiry = (exp_date - now_date).days
-                if days_till_expiry <= 0:
-                    continue
-
-                strike_sides = [
-                    (atm_strike, "C"), (atm_strike, "P"),
-                    (c1, "C"), (p1, "P"),
-                    (c2, "C"), (p2, "P"),
-                ]
-
+                exp_date, days_till_expiry, strike_sides = daily_legs
                 per_ts[ts] = (underlying_price, days_till_expiry, exp_date, strike_sides)
 
             if not per_ts:
@@ -784,8 +798,9 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 mkt_df_win = pd.DataFrame()
 
             if trd_tcol and not trd_df_all.empty:
+                win_start_trd = window_start - pd.Timedelta(minutes=10)
                 trd_df_win = trd_df_all[
-                    (trd_df_all[trd_tcol] >= window_start) &
+                    (trd_df_all[trd_tcol] >= win_start_trd) &
                     (trd_df_all[trd_tcol] < window_end) &
                     (trd_df_all["symbol"].isin(raw_needed))
                 ].copy()
@@ -812,9 +827,6 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                 else:
                     time_decay_bucket = "LOW"
 
-                ts_utc = pd.Timestamp(ts).tz_convert("UTC")
-                snapshot_id = f"{symbol}_{ts_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-
                 out = get_contract_data_from_dfs_fast(
                     strike_sides,
                     days_till_expiry,
@@ -835,36 +847,50 @@ def run_shard_two_phase(symbols: list[str], days_back: int = 35):
                     if strike == strike_sides[0][0]:
                         bucket = "ATM"
                     elif strike in (strike_sides[2][0], strike_sides[3][0]):
-                        bucket = "OTM_1"
+                        bucket = "OTM1"
                     else:
-                        bucket = "OTM_2"
+                        bucket = "OTM2"
 
                     append_row(
-                        results,
-                        snapshot_id, ts, symbol, underlying_price,
-                        days_till_expiry, exp_date, time_decay_bucket,
-                        strike, bucket, side,
-                        bid, ask, mid, vol, oi, iv, spread, spread_pct
+                        snapshot_results,
+                        ts, symbol, underlying_price, strike, side,
+                        days_till_expiry, exp_date, bucket, mid, iv,
+                        time_decay_bucket
+                    )
+                    append_volume_row(
+                        volume_results,
+                        ts, symbol, side, days_till_expiry, bucket, vol,
+                        time_decay_bucket
                     )
 
-        if not results:
+        if not snapshot_results and not volume_results:
             print(f"⏭️ {symbol}: no rows produced")
             continue
 
-        df = pd.DataFrame(results)
-        # DuckDB TIMESTAMP is tz-naive; store UTC-naive
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+        snapshot_df = pd.DataFrame(snapshot_results)
+        volume_df = pd.DataFrame(volume_results)
+
+        for df in [snapshot_df, volume_df]:
+            if not df.empty:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
 
         con = duckdb.connect(DB_PATH)
         try:
-            con.register("df_view", df)
-            cols = ",".join(df.columns)
-            con.execute(f"INSERT INTO option_snapshots_raw({cols}) SELECT {cols} FROM df_view")
-            con.unregister("df_view")
+            if not snapshot_df.empty:
+                con.register("snapshot_view", snapshot_df)
+                snapshot_cols = ",".join(snapshot_df.columns)
+                con.execute(f"INSERT INTO option_snapshots_raw({snapshot_cols}) SELECT {snapshot_cols} FROM snapshot_view")
+                con.unregister("snapshot_view")
+
+            if not volume_df.empty:
+                con.register("volume_view", volume_df)
+                volume_cols = ",".join(volume_df.columns)
+                con.execute(f"INSERT INTO rolling_volume_history({volume_cols}) SELECT {volume_cols} FROM volume_view")
+                con.unregister("volume_view")
         finally:
             con.close()
 
-        print(f"✅ {symbol}: inserted {len(df):,} rows")
+        print(f"✅ {symbol}: inserted {len(snapshot_df):,} snapshot rows and {len(volume_df):,} volume rows")
 
 
 
@@ -934,4 +960,3 @@ def main1():
 
 if __name__ == "__main__":
     main()
-

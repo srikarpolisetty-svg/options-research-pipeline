@@ -42,9 +42,62 @@ DUCKDB_LIVE_PATH = "live_state.duckdb"
 
 # raw_symbol universe cache written by universe_builder (newline-delimited)
 RAW_UNIVERSE_CACHE_PATH = "state/raw_universe_cache.txt"
+UNIVERSE_CACHE_DB_PATH = "state/universe_cache.duckdb"
+UNIVERSE_TABLE = "universe_targets"
 
 # snapshot freshness gates (used by snapshot mode; harmless to keep here)
 STRIKES_MAX_AGE_MIN = 20
+
+
+import duckdb
+import databento as db
+import time
+
+
+con = duckdb.connect("rawsymbols.db")
+
+raw_symbol_list = [
+    row[0]
+    for row in con.execute("""
+        SELECT DISTINCT raw_option_symbol
+        FROM raw_symbols
+        WHERE raw_option_symbol IS NOT NULL
+        ORDER BY raw_option_symbol
+    """).fetchall()
+]
+
+con.close()
+
+live = db.Live(key=DATABENTO_API_KEY)
+
+batch_size = 200
+for i in range(0, len(raw_symbol_list), batch_size):
+    batch = raw_symbol_list[i:i + batch_size]
+    live.subscribe(
+        dataset="OPRA.PILLAR",
+        schema="cbbo-1m",
+        symbols=batch,
+        stype_in="raw_symbol",
+    )
+    live.subscribe(
+        dataset="OPRA.PILLAR",
+        schema="trades",
+        symbols=batch,
+        stype_in="raw_symbol",
+    )
+    time.sleep(0.25)
+
+live.start()
+
+for rec in live:
+    print(rec.rtype)
+
+
+    
+
+
+
+
 
 
 # -------------------------
@@ -123,6 +176,157 @@ def compute_quote_fields(bid: float | None, ask: float | None):
     return None, None, None
 
 
+def is_symbol_mapping_msg(rec) -> bool:
+    # SymbolMappingMsg can be identified by class name or rtype suffix.
+    if type(rec).__name__ == "SymbolMappingMsg":
+        return True
+    rtype = getattr(rec, "rtype", None)
+    return bool(rtype is not None and str(rtype).endswith("SYMBOL_MAPPING"))
+
+
+def maybe_update_symbol_mapping(rec, inst_to_raw: dict[int, str]) -> bool:
+    if not is_symbol_mapping_msg(rec):
+        return False
+    inst = getattr(rec, "instrument_id", None)
+    sym = getattr(rec, "stype_in_symbol", None) or getattr(rec, "stype_out_symbol", None)
+    if inst is not None and sym:
+        try:
+            inst_to_raw[int(inst)] = str(sym)
+        except Exception:
+            pass
+    return True
+
+
+def resolve_raw_symbol(rec, inst_to_raw: dict[int, str]) -> str | None:
+    # Live market records are usually keyed by instrument_id; map that to raw_symbol.
+    inst = getattr(rec, "instrument_id", None)
+    if inst is not None:
+        try:
+            raw = inst_to_raw.get(int(inst))
+            if raw:
+                return raw
+        except Exception:
+            pass
+    # Fallback for records that already expose symbol/raw_symbol.
+    raw = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
+    return str(raw) if raw else None
+
+
+def extract_bid_ask(rec) -> tuple[float | None, float | None]:
+    # Databento Python record interface can expose BBO levels via levels[0].
+    levels = getattr(rec, "levels", None)
+    if levels is not None:
+        try:
+            lvl0 = levels[0]
+        except Exception:
+            lvl0 = None
+        if lvl0 is not None:
+            bid = getattr(lvl0, "pretty_bid_px", None)
+            ask = getattr(lvl0, "pretty_ask_px", None)
+            if bid is None and ask is None:
+                bid = getattr(lvl0, "bid_px", None)
+                ask = getattr(lvl0, "ask_px", None)
+            if bid is not None or ask is not None:
+                return bid, ask
+
+    # Backward-compatible fallback to flattened top-of-book fields.
+    bid = getattr(rec, "pretty_bid_px_00", None)
+    ask = getattr(rec, "pretty_ask_px_00", None)
+    if bid is None and ask is None:
+        bid = getattr(rec, "bid_px_00", None)
+        ask = getattr(rec, "ask_px_00", None)
+    return bid, ask
+
+
+def load_universe_cache_db(
+    db_path: str = UNIVERSE_CACHE_DB_PATH,
+    table: str = UNIVERSE_TABLE,
+) -> tuple[list[str], list[tuple]]:
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except Exception:
+        return [], []
+
+    try:
+        df = con.execute(
+            f"""
+            SELECT
+                parent_symbol,
+                label,
+                instrument_class,
+                exp_yyyymmdd,
+                expiration_date,
+                strike_price,
+                raw_symbol,
+                underlying_price,
+                ts_refresh
+            FROM {table}
+            ORDER BY parent_symbol, label, instrument_class
+            """
+        ).fetchdf()
+    except Exception:
+        con.close()
+        return [], []
+
+    con.close()
+
+    if df is None or df.empty:
+        return [], []
+
+    raws: list[str] = []
+    strike_rows: list[tuple] = []
+    seen_raw = set()
+    seen_key = set()
+
+    for _, r in df.iterrows():
+        parent = str(r["parent_symbol"])
+        label = str(r["label"])
+        cp = str(r["instrument_class"])
+        exp_yyyymmdd = str(r["exp_yyyymmdd"])
+
+        try:
+            strike = float(r["strike_price"])
+        except Exception:
+            continue
+
+        raw = str(r["raw_symbol"]) if pd.notna(r["raw_symbol"]) else None
+        if not raw:
+            continue
+
+        try:
+            underlying_px = float(r["underlying_price"])
+        except Exception:
+            underlying_px = None
+
+        expiration_date = r["expiration_date"] if pd.notna(r["expiration_date"]) else None
+        ts_refresh = to_utc_naive(r["ts_refresh"]) or utc_now_naive()
+
+        if raw not in seen_raw:
+            seen_raw.add(raw)
+            raws.append(raw)
+
+        key = (parent, label, cp)
+        if key in seen_key:
+            continue
+        seen_key.add(key)
+
+        strike_rows.append(
+            (
+                parent,
+                label,
+                cp,
+                exp_yyyymmdd,
+                expiration_date,
+                strike,
+                raw,
+                underlying_px,
+                ts_refresh,
+            )
+        )
+
+    return raws, strike_rows
+
+
 def load_universe_cache(path: str):
     """
     Expected per line (space-separated):
@@ -159,20 +363,41 @@ def load_universe_cache(path: str):
                 except Exception:
                     continue
 
-                # parts[5] is root/underlying symbol (unused)
-                raw = parts[6]
+                # Supports both:
+                #   new format: parent label cp exp strike raw underlying ts...
+                #   legacy format: parent label cp exp strike root short_raw underlying ts...
+                raw = None
+                underlying_px = None
+                ts_idx = None
 
-                try:
-                    underlying_px = float(parts[7])
-                except Exception:
-                    underlying_px = None
+                # New format first.
+                if len(parts) >= 8:
+                    try:
+                        raw = parts[5]
+                        underlying_px = float(parts[6])
+                        ts_idx = 7
+                    except Exception:
+                        raw = None
+
+                # Legacy fallback.
+                if raw is None and len(parts) >= 9:
+                    try:
+                        raw = parts[6]
+                        underlying_px = float(parts[7])
+                        ts_idx = 8
+                    except Exception:
+                        raw = None
+
+                if raw is None:
+                    continue
 
                 # ts_refresh: if present, parse; else set now
                 ts_refresh = utc_now_naive()
-                if len(parts) >= 10:
-                    ts_refresh = to_utc_naive(parts[8] + " " + parts[9]) or ts_refresh
-                elif len(parts) >= 9:
-                    ts_refresh = to_utc_naive(parts[8]) or ts_refresh
+                if ts_idx is not None:
+                    if len(parts) >= ts_idx + 2:
+                        ts_refresh = to_utc_naive(parts[ts_idx] + " " + parts[ts_idx + 1]) or ts_refresh
+                    elif len(parts) >= ts_idx + 1:
+                        ts_refresh = to_utc_naive(parts[ts_idx]) or ts_refresh
 
                 # expiration_date from exp_yyyymmdd
                 expiration_date = None
@@ -213,6 +438,15 @@ def load_universe_cache(path: str):
         return [], []
 
 
+def load_universe() -> tuple[list[str], list[tuple], str]:
+    raws, strike_rows = load_universe_cache_db()
+    if raws or strike_rows:
+        return raws, strike_rows, "duckdb"
+
+    raws, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+    return raws, strike_rows, "text"
+
+
 # -------------------------
 # STREAMER: SUBSCRIBE + STREAM -> UPSERT LIVE TABLE
 # -------------------------
@@ -227,6 +461,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
     quote_latest: dict[str, dict] = {}
     vol_deques: dict[str, deque] = {}
     vol_latest: dict[str, dict] = {}
+    inst_to_raw: dict[int, str] = {}
 
     con = duckdb.connect(DUCKDB_LIVE_PATH)
 
@@ -291,7 +526,14 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 
     # Use callback queue (Databento Live has no next_record)
     record_q = deque(maxlen=200_000)
-    live.add_callback(lambda rec: record_q.append(rec))
+
+    def _cb(rec):
+        record_q.append(rec)
+
+    def _cb_exc(exc: Exception):
+        print(f"[DATABENTO_CALLBACK_EXCEPTION] {exc}")
+
+    live.add_callback(record_callback=_cb, exception_callback=_cb_exc)
 
     subscribed: set[str] = set()
     last_refresh = 0.0
@@ -320,18 +562,20 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
             if (time.time() - last_refresh) >= REFRESH_SEC:
                 last_refresh = time.time()
 
-                desired_raws, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
+                desired_raws, strike_rows, src = load_universe()
                 if strike_rows:
                     parents = sorted({row[0] for row in strike_rows})
                     con.executemany(clear_old_labels, [(p,) for p in parents])
                     con.executemany(upsert_meta, strike_rows)
 
                 if not desired_raws:
-                    print(f"Universe cache empty/missing: {RAW_UNIVERSE_CACHE_PATH}")
+                    print(
+                        f"Universe cache empty/missing (db={UNIVERSE_CACHE_DB_PATH}, text={RAW_UNIVERSE_CACHE_PATH})"
+                    )
                 else:
                     to_add = [r for r in desired_raws if r not in subscribed]
                     if to_add:
-                        print(f"Subscribing NEW raws from cache: {len(to_add)}")
+                        print(f"Subscribing NEW raws from {src} cache: {len(to_add)}")
                         subscribe_raws(live, to_add)
                         subscribed.update(to_add)
                     else:
@@ -342,12 +586,14 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
             now_sec = time.time()
 
             if rec is not None:
-                raw = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
+                if maybe_update_symbol_mapping(rec, inst_to_raw):
+                    continue
+
+                raw = resolve_raw_symbol(rec, inst_to_raw)
                 if raw:
                     ts_event = to_utc_naive(getattr(rec, "ts_event", None))
 
-                    bid = getattr(rec, "bid_px_00", None)
-                    ask = getattr(rec, "ask_px_00", None)
+                    bid, ask = extract_bid_ask(rec)
 
                     # Quote record (cbbo-1m)
                     if bid is not None or ask is not None:
@@ -419,10 +665,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
         except Exception:
             pass
         try:
-            live.close()
-        except Exception:
-            pass
-        try:
             con.close()
         except Exception:
             pass
@@ -439,8 +681,8 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str], initial_strike_rows:
 def main():
     init_live_duckdb()
 
-    raw_symbols, strike_rows = load_universe_cache(RAW_UNIVERSE_CACHE_PATH)
-    print("Initial raw_symbols from cache:", len(raw_symbols))
+    raw_symbols, strike_rows, src = load_universe()
+    print(f"Initial raw_symbols from {src} cache:", len(raw_symbols))
 
     stream_to_duckdb_latest(raw_symbols, strike_rows)
 

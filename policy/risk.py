@@ -1,0 +1,9 @@
+from __future__ import annotations
+
+PER_TRADE_RISK_PCT = 0.02
+PER_DAY_RISK_PCT = 0.04
+MAX_OPEN_ORDERS = 5
+MIN_ORDER_AGE_SECONDS = 15 * 60
+TRAIL_PCT = 0.20
+TRAIL_TIF = "GTC"
+ENTRY_QTY = 2

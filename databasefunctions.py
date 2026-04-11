@@ -177,7 +177,8 @@ import pandas as pd
 
 
 SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-CACHE_PATH = "/home/ubuntu/supreme-options-bot-prekafka/sp500_constituents.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_PATH = os.path.join(BASE_DIR, "state", "sp500_constituents.csv")
 
 def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)

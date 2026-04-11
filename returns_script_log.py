@@ -1,24 +1,11 @@
 from returns_script_functions import fill_return_label
 from returns_script_functions import fill_return_label_executionsignals
+from policy.expiration import is_in_third_friday_week
 
 import datetime
 import sys
 from zoneinfo import ZoneInfo
 import exchange_calendars as ecals
-
-
-def _third_friday_of_month(d: datetime.date) -> datetime.date:
-    first = d.replace(day=1)
-    days_until_friday = (4 - first.weekday()) % 7  # Friday=4
-    first_friday = first + datetime.timedelta(days=days_until_friday)
-    return first_friday + datetime.timedelta(days=14)
-
-
-def _is_third_friday_week(d: datetime.date) -> tuple[bool, datetime.date]:
-    tf = _third_friday_of_month(d)
-    week_start = tf - datetime.timedelta(days=tf.weekday())   # Monday
-    week_end = week_start + datetime.timedelta(days=6)        # Sunday
-    return (week_start <= d <= week_end), tf
 
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -29,7 +16,7 @@ now_ny = datetime.datetime.now(NY_TZ)
 # -------------------------
 # Skip the entire 3rd-Friday week (monthly expiration week)
 # -------------------------
-is_tf_week, tf_date = _is_third_friday_week(now_ny.date())
+is_tf_week, tf_date = is_in_third_friday_week(now_ny.date())
 if is_tf_week:
     print(
         f"[SKIP] Third-Friday week detected. third_friday={tf_date} "
@@ -122,5 +109,3 @@ fill_return_label_executionsignals(
 
 now = datetime.datetime.now()
 print(now.strftime("%Y-%m-%d %H:%M"))
-
-

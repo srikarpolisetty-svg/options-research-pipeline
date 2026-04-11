@@ -3,6 +3,7 @@ import requests
 
 from dotenv import load_dotenv
 import os
+from policy.risk import TRAIL_PCT
 
 load_dotenv()   # ← once, at startup
 
@@ -415,10 +416,10 @@ def get_all_symbols(con, table="option_snapshots_enriched"):
 
 
 
-def trail_exit_signals(data, token_response, trail_pct=0.20):
+def trail_exit_signals(data, token_response, trail_pct=TRAIL_PCT):
     """
     Trailing stop exit for OPTION positions only.
-    trail_pct=0.20 means: exit if price drops 20% from max.
+    trail_pct means: exit if price drops trail_pct from max.
     """
 
     update_max_prices(data)

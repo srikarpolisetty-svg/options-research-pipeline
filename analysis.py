@@ -1,45 +1,13 @@
 import duckdb
 from message import send_text
 from analysis_functions import load_all_groups, get_option_metrics, update_signal
+from policy.expiration import is_in_third_friday_week
+from policy.signals import SIGNAL_THRESHOLDS
 
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import exchange_calendars as ecals
-
-
-def _third_friday_of_month(d) -> datetime.date:
-    first = d.replace(day=1)
-    days_until_friday = (4 - first.weekday()) % 7
-    first_friday = first + timedelta(days=days_until_friday)
-    third_friday = first_friday + timedelta(days=14)
-    return third_friday
-
-
-def _is_third_friday_week(d) -> tuple[bool, datetime.date]:
-    tf = _third_friday_of_month(d)
-    week_start = tf - timedelta(days=tf.weekday())  # Monday
-    week_end = week_start + timedelta(days=6)       # Sunday
-    return (week_start <= d <= week_end), tf
-
-
-# -------------------------
-# Hardcoded thresholds (no overrides)
-# -------------------------
-THRESHOLDS = {
-    "ATM": {
-        "5w": {"price": 0.9, "volume": 1.1, "iv": 0.1},
-        "3d": {"price": 1.0, "volume": 1.2, "iv": 0.1},
-    },
-    "OTM_1": {
-        "5w": {"price": 1.2, "volume": 1.1, "iv": 0.2},
-        "3d": {"price": 1.3, "volume": 1.25, "iv": 0.2},
-    },
-    "OTM_2": {
-        "5w": {"price": 0.6, "volume": 1.4, "iv": 0.05},
-        "3d": {"price": 0.7, "volume": 1.6, "iv": 0.05},
-    },
-}
 
 
 def run_option_signals(symbol: str):
@@ -49,7 +17,7 @@ def run_option_signals(symbol: str):
     now = datetime.now(NY_TZ)
 
     # Skip the entire 3rd-Friday week (monthly expiration week)
-    is_tf_week, tf_date = _is_third_friday_week(now.date())
+    is_tf_week, tf_date = is_in_third_friday_week(now.date())
     if is_tf_week:
         print(
             f"[SKIP] Third-Friday week detected. third_friday={tf_date} "
@@ -86,7 +54,7 @@ def run_option_signals(symbol: str):
             return False
 
     def handle_bucket(bucket: str):
-        thr_cfg = THRESHOLDS[bucket]
+        thr_cfg = SIGNAL_THRESHOLDS[bucket]
 
         t5_price = thr_cfg["5w"]["price"]
         t5_vol   = thr_cfg["5w"]["volume"]
@@ -175,5 +143,4 @@ def run_option_signals(symbol: str):
     handle_bucket("OTM_2")
 
     con.close()
-
 

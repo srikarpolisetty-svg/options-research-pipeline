@@ -9,28 +9,16 @@ from zoneinfo import ZoneInfo
 import duckdb
 import exchange_calendars as ecals
 from ib_insync import IB, Contract, MarketOrder, StopOrder, Order
-from datetime import date, timedelta
-
-
-def third_friday_of_month(d: date) -> date:
-    """
-    Return the 3rd Friday of the month for date d.
-    """
-    first = d.replace(day=1)
-    days_to_friday = (4 - first.weekday()) % 7  # Friday = 4
-    first_friday = first + timedelta(days=days_to_friday)
-    return first_friday + timedelta(days=14)
-
-
-def is_third_friday_week(d: date) -> tuple[bool, date]:
-    """
-    Returns (True, third_friday_date) if d is in the Monday–Sunday
-    week that contains the 3rd Friday of the month.
-    """
-    tf = third_friday_of_month(d)
-    week_start = tf - timedelta(days=tf.weekday())  # Monday
-    week_end = week_start + timedelta(days=6)       # Sunday
-    return week_start <= d <= week_end, tf
+from policy.expiration import is_in_third_friday_week
+from policy.risk import (
+    ENTRY_QTY,
+    MAX_OPEN_ORDERS,
+    MIN_ORDER_AGE_SECONDS,
+    PER_DAY_RISK_PCT,
+    PER_TRADE_RISK_PCT,
+    TRAIL_PCT,
+    TRAIL_TIF,
+)
 
 
 # =========================
@@ -49,13 +37,13 @@ ALLOW_EXITS_WHEN_KILLED = True
 
 @dataclass
 class RiskConfig:
-    per_trade_risk_pct: float = 0.02
-    per_day_risk_pct: float = 0.04
-    max_open_orders: int = 5
-    min_order_age_seconds: int = 15 * 60
-    trail_pct: float = 0.20  # 0.20 = 20%
-    trail_tif: str = "GTC"   # "DAY" or "GTC"
-    entry_qty: int = 2       # default entry size
+    per_trade_risk_pct: float = PER_TRADE_RISK_PCT
+    per_day_risk_pct: float = PER_DAY_RISK_PCT
+    max_open_orders: int = MAX_OPEN_ORDERS
+    min_order_age_seconds: int = MIN_ORDER_AGE_SECONDS
+    trail_pct: float = TRAIL_PCT
+    trail_tif: str = TRAIL_TIF
+    entry_qty: int = ENTRY_QTY
 
 
 class IBKRExecutionEngine:
@@ -539,7 +527,7 @@ class IBKRExecutionEngine:
         self.log("RUN_START", symbol=symbol, client_id=self.client_id, port=self.port)
 
         today = datetime.now(self.NY_TZ).date()
-        is_tf_week, tf_date = is_third_friday_week(today)
+        is_tf_week, tf_date = is_in_third_friday_week(today)
         self.log("GATE_CAL", symbol=symbol, today=today, is_third_friday_week=is_tf_week, third_friday=tf_date)
 
         if is_tf_week:

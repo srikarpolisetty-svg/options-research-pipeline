@@ -24,6 +24,8 @@ import duckdb
 
 from databasefunctions import get_sp500_symbols
 from config import DATABENTO_API_KEY
+from policy.expiration import LOOKAHEAD_DAYS_DEFAULT, find_first_eligible_friday
+from policy.strikes import build_strike_map
 
 
 # -------------------------
@@ -166,27 +168,16 @@ def to_utc_naive(ts) -> datetime.datetime | None:
 
 
 def get_friday_within_4_days(expirations: list[str], today_utc: datetime.date) -> str | None:
-    for exp in sorted(expirations):
-        d = datetime.datetime.strptime(exp, "%Y%m%d").date()
-        if d.weekday() == 4 and 0 <= (d - today_utc).days <= 4:
-            return exp
-    return None
-
-
-
-def closest_strike(target: float, strikes: list[float]) -> float:
-    return float(min(strikes, key=lambda s: abs(float(s) - float(target))))
+    return find_first_eligible_friday(
+        expirations,
+        today_utc,
+        lookahead_days=LOOKAHEAD_DAYS_DEFAULT,
+        exclude_third_friday=False,
+    )
 
 
 def pick_strikes(underlying_price: float, strikes: list[float]) -> dict:
-    atm = underlying_price
-    return {
-        "ATM": closest_strike(atm, strikes),
-        "C1": closest_strike(atm * 1.015, strikes),
-        "P1": closest_strike(atm * 0.985, strikes),
-        "C2": closest_strike(atm * 1.035, strikes),
-        "P2": closest_strike(atm * 0.965, strikes),
-    }
+    return build_strike_map(float(underlying_price), strikes)
 
 
 def pick_raw_symbol(sub: pd.DataFrame, strike: float, cp: str) -> str | None:
@@ -206,6 +197,68 @@ def compute_quote_fields(bid: float | None, ask: float | None):
         spread_pct = (spread / mid) if mid > 0 else None
         return mid, spread, spread_pct
     return None, None, None
+
+
+def is_symbol_mapping_msg(rec) -> bool:
+    # SymbolMappingMsg can be identified by class name or rtype suffix.
+    if type(rec).__name__ == "SymbolMappingMsg":
+        return True
+    rtype = getattr(rec, "rtype", None)
+    return bool(rtype is not None and str(rtype).endswith("SYMBOL_MAPPING"))
+
+
+def maybe_update_symbol_mapping(rec, inst_to_raw: dict[int, str]) -> bool:
+    if not is_symbol_mapping_msg(rec):
+        return False
+    inst = getattr(rec, "instrument_id", None)
+    sym = getattr(rec, "stype_in_symbol", None) or getattr(rec, "stype_out_symbol", None)
+    if inst is not None and sym:
+        try:
+            inst_to_raw[int(inst)] = str(sym)
+        except Exception:
+            pass
+    return True
+
+
+def resolve_raw_symbol(rec, inst_to_raw: dict[int, str]) -> str | None:
+    # Live market records are usually keyed by instrument_id; map that to raw_symbol.
+    inst = getattr(rec, "instrument_id", None)
+    if inst is not None:
+        try:
+            raw = inst_to_raw.get(int(inst))
+            if raw:
+                return raw
+        except Exception:
+            pass
+    # Fallback for records that already expose symbol/raw_symbol.
+    raw = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
+    return str(raw) if raw else None
+
+
+def extract_bid_ask(rec) -> tuple[float | None, float | None]:
+    # Databento Python record interface can expose BBO levels via levels[0].
+    levels = getattr(rec, "levels", None)
+    if levels is not None:
+        try:
+            lvl0 = levels[0]
+        except Exception:
+            lvl0 = None
+        if lvl0 is not None:
+            bid = getattr(lvl0, "pretty_bid_px", None)
+            ask = getattr(lvl0, "pretty_ask_px", None)
+            if bid is None and ask is None:
+                bid = getattr(lvl0, "bid_px", None)
+                ask = getattr(lvl0, "ask_px", None)
+            if bid is not None or ask is not None:
+                return bid, ask
+
+    # Backward-compatible fallback to flattened top-of-book fields.
+    bid = getattr(rec, "pretty_bid_px_00", None)
+    ask = getattr(rec, "pretty_ask_px_00", None)
+    if bid is None and ask is None:
+        bid = getattr(rec, "bid_px_00", None)
+        ask = getattr(rec, "ask_px_00", None)
+    return bid, ask
 
 
 # -------------------------
@@ -497,6 +550,7 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
     quote_latest: dict[str, dict] = {}
     vol_deques: dict[str, deque] = {}
     vol_latest: dict[str, dict] = {}
+    inst_to_raw: dict[int, str] = {}
 
     con = duckdb.connect(DUCKDB_LIVE_PATH)
 
@@ -540,6 +594,15 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
     """
 
     live = db.Live(key=DATABENTO_API_KEY)
+    record_q = deque(maxlen=200_000)
+
+    def _cb(rec):
+        record_q.append(rec)
+
+    def _cb_exc(exc: Exception):
+        print(f"[DATABENTO_CALLBACK_EXCEPTION] {exc}")
+
+    live.add_callback(record_callback=_cb, exception_callback=_cb_exc)
 
     subscribed: set[str] = set()
     last_refresh = 0.0
@@ -601,17 +664,19 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
                 else:
                     print("No new raws to add.")
 
-            rec = live.next_record(timeout=1.0)
+            rec = record_q.popleft() if record_q else None
             now_sec = time.time()
 
             if rec is not None:
-                raw = getattr(rec, "symbol", None) or getattr(rec, "raw_symbol", None)
+                if maybe_update_symbol_mapping(rec, inst_to_raw):
+                    continue
+
+                raw = resolve_raw_symbol(rec, inst_to_raw)
                 if raw:
                     ts_event = to_utc_naive(getattr(rec, "ts_event", None))
 
                     # QUOTES (mbp-1)
-                    bid = getattr(rec, "bid_px_00", None)
-                    ask = getattr(rec, "ask_px_00", None)
+                    bid, ask = extract_bid_ask(rec)
                     if bid is not None or ask is not None:
                         bid_f = float(bid) if bid is not None and bid > 0 else None
                         ask_f = float(ask) if ask is not None and ask > 0 else None
@@ -686,10 +751,6 @@ def stream_to_duckdb_latest(initial_raw_symbols: list[str]):
         except Exception:
             pass
         try:
-            live.close()
-        except Exception:
-            pass
-        try:
             con.close()
         except Exception:
             pass
@@ -748,6 +809,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
