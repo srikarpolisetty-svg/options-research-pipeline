@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import _path_setup  # noqa: F401
 from backtest_data_utils import MAX_BATCH_SYMBOLS, _split_symbol_batches
 
 

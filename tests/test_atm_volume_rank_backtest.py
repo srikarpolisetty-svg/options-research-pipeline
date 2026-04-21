@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
+import _path_setup  # noqa: F401
 import pandas as pd
 
 from atm_volume_rank_backtest import (

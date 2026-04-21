@@ -1,6 +1,7 @@
 import databento as db
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+import _path_setup  # noqa: F401
 from config import DATABENTO_API_KEY
 import duckdb
 import math

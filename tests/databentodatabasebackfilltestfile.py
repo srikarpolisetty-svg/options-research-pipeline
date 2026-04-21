@@ -17,6 +17,7 @@ import databento as db
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+import _path_setup  # noqa: F401
 from config import DATABENTO_API_KEY
 import math
 import duckdb
