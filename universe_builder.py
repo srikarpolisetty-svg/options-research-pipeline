@@ -10,6 +10,12 @@ from policy.option_symbols import (
 )
 from policy.strikes import closest_strike
 
+PROGRESS_EVERY = 50
+
+
+def debug(message: str) -> None:
+    print(f"[UNIVERSE] {message}", flush=True)
+
 
 def expiration_to_utc_date(value):
     ts = pd.to_datetime(value, errors="coerce", utc=True)
@@ -50,8 +56,9 @@ def format_reason_counts(reason_counts: dict[str, int]) -> str:
     return ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items()))
 
 
-con = duckdb.connect("definitioncache.duckdb")
+con = duckdb.connect("definitioncache.duckdb", read_only=True)
 raw_con = duckdb.connect("rawsymbols.db")
+debug("db open definitioncache=read_only rawsymbols=write")
 raw_con.execute("""
 CREATE TABLE IF NOT EXISTS raw_symbols (
     parent_symbol TEXT,
@@ -77,6 +84,7 @@ symbols = [r[0] for r in con.execute("""
 """).fetchall()]
 symbols = filter_supported_option_chain_symbols([str(symbol) for symbol in symbols])
 today_utc = dt.datetime.now(dt.timezone.utc).date()
+debug(f"start symbols={len(symbols)} date={today_utc}")
 summary_counts: dict[str, int] = defaultdict(int)
 expiry_reason_counts: dict[str, int] = defaultdict(int)
 expiry_reason_samples: list[str] = []
@@ -84,6 +92,12 @@ inserted_rows = 0
 
 for sym in symbols:
     summary_counts["symbols_seen"] += 1
+    if summary_counts["symbols_seen"] == 1 or summary_counts["symbols_seen"] % PROGRESS_EVERY == 0:
+        debug(
+            f"progress {summary_counts['symbols_seen']}/{len(symbols)} "
+            f"inserted={summary_counts['inserted_symbols']} "
+            f"no_exp={summary_counts['no_valid_weekly_expiration']}"
+        )
     df = con.execute("""
         SELECT *
         FROM definition_cache AS d

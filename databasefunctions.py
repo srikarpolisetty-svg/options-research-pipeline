@@ -1,7 +1,8 @@
 import duckdb
 import pandas as pd
+import os
 
-DB_PATH = "/home/ubuntu/supreme-options-bot-prekafka/options_data.db"
+DB_PATH = os.getenv("OPTIONS_DB_PATH", "options_data.db")
 
 def compute_z_scores_for_bucket(
     symbol: str,

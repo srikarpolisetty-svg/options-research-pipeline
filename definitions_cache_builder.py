@@ -167,14 +167,14 @@ def build_definition_cache():
         for symbol in raw_symbols
         if isinstance(symbol, str) and str(symbol).strip().upper() in UNSUPPORTED_OPTION_CHAIN_SYMBOLS
     })
-    print(f"Total symbols: {len(symbols)}")
+    print(f"[DEFS] total symbols={len(symbols)}", flush=True)
     if skipped_symbols:
         print(
-            f"Skipping unsupported option-chain symbols={len(skipped_symbols)} "
+            f"[DEFS] skipping unsupported symbols={len(skipped_symbols)} "
             f"symbols={', '.join(skipped_symbols)}"
         )
     print(
-        f"Definition query range: market_date={market_date.isoformat()} "
+        f"[DEFS] query range market_date={market_date.isoformat()} "
         f"start={start.isoformat()} end={end.isoformat()}"
     )
 
@@ -251,10 +251,10 @@ def build_definition_cache():
                     )
 
     con.close()
-    print("DONE")
-    print(f"Inserted rows: {inserted_total}")
-    print(f"Skipped (empty): {skipped}")
-    print(f"Errors: {errors}")
+    print("[DEFS] done", flush=True)
+    print(f"[DEFS] inserted_rows={inserted_total}", flush=True)
+    print(f"[DEFS] skipped_empty={skipped}", flush=True)
+    print(f"[DEFS] errors={errors}", flush=True)
 
 
 if __name__ == "__main__":

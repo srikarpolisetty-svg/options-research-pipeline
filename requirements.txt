@@ -1,5 +1,6 @@
 databento==0.72.0
 databento-dbn==0.50.0
+confluent-kafka
 duckdb
 exchange-calendars
 ib-insync

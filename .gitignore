@@ -1,9 +1,12 @@
 # env / secrets
 .env
+.env.*
+!.env.example
 
 # databases
 options_data.db
 *.db
+*.duckdb
 
 # binaries / zips
 duckdb_cli-linux-amd64.zip
@@ -11,6 +14,8 @@ duckdb_cli-linux-amd64.zip
 # python junk
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
 
 # logs
 logs/
@@ -19,3 +24,12 @@ logs/
 # pipeline outputs
 runs/
 *.parquet
+batch_downloads/
+backtest_reports/
+backtest_reports_test/
+backtest_reports_test2/
+*.pdf
+*.csv
+
+# macOS
+.DS_Store

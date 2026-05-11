@@ -8,6 +8,7 @@ from config import DATABENTO_API_KEY
 import math
 import duckdb
 import argparse
+import json
 import zlib
 import time
 import pathlib
@@ -45,11 +46,19 @@ DEF_TS_RATE_LIMIT_WINDOW_S = 2.0
 DEF_TS_PROGRESS_EVERY = 25
 DEF_TS_SUBMIT_PROGRESS_EVERY = 25
 DEF_TS_PREPARE_PROGRESS_EVERY = 50
+DEF_TS_REQUEST_MAX_ATTEMPTS = 3
+DEF_TS_REQUEST_RETRY_DELAY_S = 1.0
+DEF_TS_REQUEST_RETRY_BACKOFF = 2.0
+YF_SYMBOL_GROUP_SIZE = 40
+YF_DOWNLOAD_MAX_ATTEMPTS = 3
+YF_DOWNLOAD_RETRY_DELAY_S = 1.0
+YF_DOWNLOAD_RETRY_BACKOFF = 2.0
 MATCH_MISS_PREVIEW = 4
 UNSUPPORTED_OPTION_CHAIN_SYMBOLS = {
     "NVR",
 }
 
+QUOTE_SCHEMA = "cbbo-1m"
 QUOTE_LOOKBACK = pd.Timedelta(hours=1)
 TRADE_LOOKBACK = pd.Timedelta(minutes=10)
 OPEN_INTEREST_LOOKBACK = pd.Timedelta(days=1)
@@ -69,6 +78,8 @@ NY_TZ = ZoneInfo("America/New_York")
 QUOTE_LOOKBACK_NS = QUOTE_LOOKBACK.value
 TRADE_LOOKBACK_NS = TRADE_LOOKBACK.value
 OPEN_INTEREST_LOOKBACK_NS = OPEN_INTEREST_LOOKBACK.value
+DATABENTO_REQUEST_FLOOR_UTC: pd.Timestamp | None = None
+DEFINITION_CACHE_ENABLED = False
 
 
 def filter_supported_option_chain_symbols(symbols: list[str]) -> list[str]:
@@ -206,8 +217,47 @@ def ensure_table():
                 status TEXT
             );
         """)
+        ensure_definition_cache_tables(con)
     finally:
         con.close()
+
+
+def ensure_definition_cache_tables(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS historical_definition_request_cache (
+            symbol TEXT,
+            parent TEXT,
+            expiration_date DATE,
+            snapshot_day DATE,
+            request_start TIMESTAMP,
+            request_end TIMESTAMP,
+            status TEXT,
+            error TEXT,
+            raw_rows INTEGER,
+            symbol_rows INTEGER,
+            expiration_rows INTEGER,
+            cp_rows INTEGER,
+            valid_rows INTEGER,
+            final_rows INTEGER,
+            symbol_expiration_dates TEXT,
+            cached_at TIMESTAMP
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS historical_definition_cache_rows (
+            symbol TEXT,
+            expiration_date DATE,
+            snapshot_day DATE,
+            ts_event TIMESTAMP,
+            underlying TEXT,
+            raw_symbol TEXT,
+            instrument_class TEXT,
+            strike_price DOUBLE,
+            strike_f DOUBLE,
+            exp_date DATE,
+            exp_ymd TEXT
+        );
+    """)
 
 
 def delete_old_rows(days_back: int) -> None:
@@ -283,6 +333,40 @@ def _to_utc_timestamp(x) -> pd.Timestamp:
     if ts.tzinfo is None:
         return ts.tz_localize("UTC")
     return ts.tz_convert("UTC")
+
+
+def set_databento_request_floor(value) -> None:
+    global DATABENTO_REQUEST_FLOOR_UTC
+    DATABENTO_REQUEST_FLOOR_UTC = _to_utc_timestamp(value) if value is not None else None
+    if DATABENTO_REQUEST_FLOOR_UTC is not None:
+        print(f"[SAFETY] Databento request floor={DATABENTO_REQUEST_FLOOR_UTC.isoformat()}")
+
+
+def set_definition_cache_enabled(enabled: bool) -> None:
+    global DEFINITION_CACHE_ENABLED
+    DEFINITION_CACHE_ENABLED = bool(enabled)
+    print(f"[DEFS] cache={'enabled' if DEFINITION_CACHE_ENABLED else 'disabled'}")
+
+
+def clamp_request_to_floor(start, end, *, label: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    start_ts = _to_utc_timestamp(start)
+    end_ts = _to_utc_timestamp(end)
+
+    if DATABENTO_REQUEST_FLOOR_UTC is not None and start_ts < DATABENTO_REQUEST_FLOOR_UTC:
+        print(
+            f"[SAFETY] clamped {label} start "
+            f"{start_ts.isoformat()} -> {DATABENTO_REQUEST_FLOOR_UTC.isoformat()}"
+        )
+        start_ts = DATABENTO_REQUEST_FLOOR_UTC
+
+    if start_ts >= end_ts:
+        print(
+            f"[SAFETY] skipped {label}: start={start_ts.isoformat()} "
+            f"end={end_ts.isoformat()}"
+        )
+        return None
+
+    return start_ts, end_ts
 
 
 def _trade_day_bounds_utc(start_day: date, end_day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -469,53 +553,141 @@ def get_eligible_expiration_with_reason(expirations: list[str], now_date: date) 
 
 
 # ---------- UNDERLYING ----------
+def is_retryable_yf_download_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retryable_fragments = (
+        "nonetype",
+        "timed out",
+        "timeout",
+        "connection",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+    )
+    return any(fragment in message for fragment in retryable_fragments)
+
+
+def download_yf_ohlc_with_retry(
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
+    *,
+    label: str,
+) -> pd.DataFrame:
+    tickers: list[str] | str = symbols if len(symbols) > 1 else symbols[0]
+    last_error: Exception | None = None
+
+    for attempt in range(1, YF_DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            df = yf.download(
+                tickers,
+                start=start,
+                end=end,
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                return df
+
+            last_error = RuntimeError("empty response")
+        except Exception as exc:
+            last_error = exc
+            if attempt >= YF_DOWNLOAD_MAX_ATTEMPTS or not is_retryable_yf_download_error(exc):
+                break
+
+        if attempt < YF_DOWNLOAD_MAX_ATTEMPTS:
+            sleep_s = YF_DOWNLOAD_RETRY_DELAY_S * (YF_DOWNLOAD_RETRY_BACKOFF ** (attempt - 1))
+            print(
+                f"[RETRY] yf {label} attempt {attempt}/{YF_DOWNLOAD_MAX_ATTEMPTS} "
+                f"failed: {last_error} | retrying in {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+
+    if last_error is not None:
+        print(f"⚠️ yf {label} failed after {YF_DOWNLOAD_MAX_ATTEMPTS} attempt(s): {last_error}")
+    return pd.DataFrame()
+
+
+def extract_underlying_open_frames(
+    df: pd.DataFrame,
+    symbol_group: list[str],
+) -> dict[str, pd.DataFrame]:
+    extracted: dict[str, pd.DataFrame] = {}
+    if df is None or df.empty:
+        return extracted
+
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Open" not in df.columns.get_level_values(0):
+            return extracted
+
+        open_block = df["Open"]
+        if isinstance(open_block, pd.Series):
+            open_block = open_block.to_frame(name=symbol_group[0])
+
+        for symbol in symbol_group:
+            if symbol not in open_block.columns:
+                continue
+
+            series = pd.to_numeric(open_block[symbol], errors="coerce").dropna()
+            if series.empty:
+                continue
+
+            extracted[symbol] = (
+                series.astype(float)
+                .rename("underlying_price")
+                .to_frame()
+                .sort_index()
+            )
+        return extracted
+
+    if len(symbol_group) != 1 or "Open" not in df.columns:
+        return extracted
+
+    series = pd.to_numeric(df["Open"], errors="coerce").dropna()
+    if series.empty:
+        return extracted
+
+    extracted[symbol_group[0]] = (
+        series.astype(float)
+        .rename("underlying_price")
+        .to_frame()
+        .sort_index()
+    )
+    return extracted
+
+
 def fetch_last_days(symbols: list[str], days: int) -> dict[str, pd.DataFrame] | None:
     end = db_end_utc_day()
     start = end - timedelta(days=days)
     symbol_groups = [
-        symbols[i:i + 40]
-        for i in range(0, len(symbols), 40)
+        symbols[i:i + YF_SYMBOL_GROUP_SIZE]
+        for i in range(0, len(symbols), YF_SYMBOL_GROUP_SIZE)
     ]
     cleaned: dict[str, pd.DataFrame] = {}
 
     for symbol_group in symbol_groups:
-        df = yf.download(
+        df = download_yf_ohlc_with_retry(
             symbol_group,
-            start=start,
-            end=end,
-            interval="1d",
-            progress=False,
-            auto_adjust=False,
+            start,
+            end,
+            label=",".join(symbol_group),
         )
-        if df is None or df.empty:
-            continue
+        cleaned.update(extract_underlying_open_frames(df, symbol_group))
 
-        if isinstance(df.columns, pd.MultiIndex):
-            if "Open" not in df.columns.get_level_values(0):
-                continue
-
-            open_block = df["Open"]
-            if isinstance(open_block, pd.Series):
-                open_block = open_block.to_frame(name=symbol_group[0])
-
-            for symbol in symbol_group:
-                if symbol not in open_block.columns:
-                    continue
-
-                series = pd.to_numeric(open_block[symbol], errors="coerce").dropna()
-                if series.empty:
-                    continue
-
-                cleaned[symbol] = series.astype(float).rename("underlying_price").to_frame().sort_index()
-        else:
-            if len(symbol_group) != 1 or "Open" not in df.columns:
-                continue
-
-            series = pd.to_numeric(df["Open"], errors="coerce").dropna()
-            if series.empty:
-                continue
-
-            cleaned[symbol_group[0]] = series.astype(float).rename("underlying_price").to_frame().sort_index()
+        missing_symbols = [symbol for symbol in symbol_group if symbol not in cleaned]
+        for symbol in missing_symbols:
+            single_df = download_yf_ohlc_with_retry(
+                [symbol],
+                start,
+                end,
+                label=symbol,
+            )
+            single_cleaned = extract_underlying_open_frames(single_df, [symbol])
+            if symbol in single_cleaned:
+                cleaned[symbol] = single_cleaned[symbol]
 
     return cleaned
 
@@ -814,6 +986,207 @@ def _rolling_sum_from_prefix(times_ns: np.ndarray, prefix: np.ndarray, start_ns:
     return float(total)
 
 
+def bs_iv_bisect(
+    mid: float | None,
+    underlying_price: float | None,
+    strike: float,
+    days_to_expiry: int,
+    call_put: str,
+) -> float | None:
+    if mid is None or mid <= 0 or underlying_price is None or underlying_price <= 0:
+        return None
+
+    time_to_expiry = float(days_to_expiry) / 365.0
+    if time_to_expiry <= 0:
+        return None
+
+    r = 0.01
+    lo, hi = 1e-6, 5.0
+
+    def normal_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def bs_price(sigma: float) -> float:
+        d1 = (
+            math.log(underlying_price / strike)
+            + (r + 0.5 * sigma * sigma) * time_to_expiry
+        ) / (sigma * math.sqrt(time_to_expiry))
+        d2 = d1 - sigma * math.sqrt(time_to_expiry)
+        if call_put == "C":
+            return (
+                underlying_price * normal_cdf(d1)
+                - strike * math.exp(-r * time_to_expiry) * normal_cdf(d2)
+            )
+        return (
+            strike * math.exp(-r * time_to_expiry) * normal_cdf(-d2)
+            - underlying_price * normal_cdf(-d1)
+        )
+
+    for _ in range(60):
+        sigma = 0.5 * (lo + hi)
+        if bs_price(sigma) > mid:
+            hi = sigma
+        else:
+            lo = sigma
+
+    return 0.5 * (lo + hi)
+
+
+def time_decay_bucket_for_dte(days_till_expiry: int) -> str:
+    if days_till_expiry <= 1:
+        return "EXTREME"
+    if days_till_expiry <= 3:
+        return "HIGH"
+    if days_till_expiry <= 7:
+        return "MEDIUM"
+    return "LOW"
+
+
+def build_leg_metadata_by_raw_symbol(
+    strike_sides,
+    days_till_expiry: int,
+    exp_date: date,
+    def_map,
+):
+    by_raw_symbol: dict[str, list[dict[str, object]]] = defaultdict(list)
+    time_decay_bucket = time_decay_bucket_for_dte(days_till_expiry)
+
+    for leg_idx, (strike, side) in enumerate(strike_sides):
+        raw_symbol = def_map.get((float(strike), str(side), exp_date))
+        if not raw_symbol:
+            continue
+
+        if leg_idx < 2:
+            grouping = "ATM"
+        elif leg_idx < 4:
+            grouping = "OTM1"
+        else:
+            grouping = "OTM2"
+
+        by_raw_symbol[str(raw_symbol)].append({
+            "strike": float(strike),
+            "side": str(side),
+            "grouping": grouping,
+            "days_to_expiry": int(days_till_expiry),
+            "expiration_date": exp_date,
+            "time_decay_bucket": time_decay_bucket,
+        })
+
+    return by_raw_symbol
+
+
+def utc_day_bounds_ns(trade_date: date) -> tuple[int, int]:
+    day_start = pd.Timestamp(trade_date).tz_localize("UTC")
+    day_end = day_start + pd.Timedelta(days=1)
+    return int(day_start.value), int(day_end.value)
+
+
+def build_intraday_rows_for_day(
+    *,
+    parent_symbol: str,
+    trade_date: date,
+    underlying_price: float,
+    strike_sides,
+    days_till_expiry: int,
+    exp_date: date,
+    def_map,
+    mkt_lookup,
+    trd_lookup,
+):
+    leg_metadata_by_raw = build_leg_metadata_by_raw_symbol(
+        strike_sides,
+        days_till_expiry,
+        exp_date,
+        def_map,
+    )
+    if not leg_metadata_by_raw:
+        return [], []
+
+    day_start_ns, day_end_ns = utc_day_bounds_ns(trade_date)
+    snapshot_rows = []
+    volume_rows = []
+
+    for raw_symbol, leg_metadata_rows in leg_metadata_by_raw.items():
+        mkt_entry = mkt_lookup.get(raw_symbol)
+        if mkt_entry is None:
+            continue
+
+        last_quote_signature = None
+        times_ns = mkt_entry["times_ns"]
+        start_idx = int(np.searchsorted(times_ns, day_start_ns, side="left"))
+        end_idx = int(np.searchsorted(times_ns, day_end_ns, side="left"))
+        if start_idx >= end_idx:
+            continue
+
+        trd_entry = trd_lookup.get(raw_symbol)
+
+        for idx in range(start_idx, end_idx):
+            ts_ns = int(times_ns[idx])
+            ts = pd.Timestamp(ts_ns, tz="UTC").to_pydatetime()
+
+            bid_val = mkt_entry["bid"][idx]
+            ask_val = mkt_entry["ask"][idx]
+            bid = float(bid_val) if np.isfinite(bid_val) else 0.0
+            ask = float(ask_val) if np.isfinite(ask_val) else 0.0
+            mid = None
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+
+            quote_changed = False
+            quote_signature = None
+            if mid is not None:
+                quote_signature = (bid, ask, mid)
+                if quote_signature != last_quote_signature:
+                    quote_changed = True
+                    last_quote_signature = quote_signature
+
+            rolling_volume = 0.0
+            if trd_entry is not None:
+                rolling_volume = _rolling_sum_from_prefix(
+                    trd_entry["times_ns"],
+                    trd_entry["size_prefix"],
+                    ts_ns - TRADE_LOOKBACK_NS,
+                    ts_ns,
+                )
+
+            for leg_metadata in leg_metadata_rows:
+                if quote_changed:
+                    iv = bs_iv_bisect(
+                        mid,
+                        underlying_price,
+                        float(leg_metadata["strike"]),
+                        int(leg_metadata["days_to_expiry"]),
+                        str(leg_metadata["side"]),
+                    )
+                    append_row(
+                        snapshot_rows,
+                        ts,
+                        parent_symbol,
+                        underlying_price,
+                        float(leg_metadata["strike"]),
+                        str(leg_metadata["side"]),
+                        int(leg_metadata["days_to_expiry"]),
+                        leg_metadata["expiration_date"],
+                        str(leg_metadata["grouping"]),
+                        mid,
+                        iv,
+                        str(leg_metadata["time_decay_bucket"]),
+                    )
+
+                append_volume_row(
+                    volume_rows,
+                    ts,
+                    parent_symbol,
+                    str(leg_metadata["side"]),
+                    int(leg_metadata["days_to_expiry"]),
+                    str(leg_metadata["grouping"]),
+                    rolling_volume,
+                    str(leg_metadata["time_decay_bucket"]),
+                )
+
+    return snapshot_rows, volume_rows
+
+
 def get_contract_data_from_lookups_fast(
     strike_sides,
     days_to_expiry,
@@ -892,33 +1265,7 @@ def get_contract_data_from_lookups_fast(
             spread = ask - bid
             spread_pct = spread / mid if mid else None
 
-        # IV solve (bisection)
-        T = days_to_expiry / 365.0
-        if mid and T > 0:
-            S = float(underlying_price)
-            K = float(strike)
-            r = 0.01
-            lo, hi = 1e-6, 5.0
-
-            def N(x):
-                return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-            def bs_price(sigma):
-                d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-                d2 = d1 - sigma * math.sqrt(T)
-                if side == "C":
-                    return S * N(d1) - K * math.exp(-r * T) * N(d2)
-                else:
-                    return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
-
-            for _ in range(60):
-                mid_sigma = 0.5 * (lo + hi)
-                if bs_price(mid_sigma) > mid:
-                    hi = mid_sigma
-                else:
-                    lo = mid_sigma
-
-            iv = 0.5 * (lo + hi)
+        iv = bs_iv_bisect(mid, underlying_price, float(strike), days_to_expiry, str(side))
 
         out[(strike, side)] = (bid, ask, mid, open_interest, volume, iv, spread, spread_pct)
 
@@ -980,11 +1327,15 @@ def batch_get_df(
 
     is_definition = schema == "definition"
     batch_client = db.Historical(DATABENTO_API_KEY)
+    bounds = clamp_request_to_floor(start, end, label=f"batch {schema}")
+    if bounds is None:
+        return pd.DataFrame()
+    request_start, request_end = bounds
 
     job = batch_client.batch.submit_job(
         dataset=dataset,
-        start=_to_iso(start),
-        end=_to_iso(end),
+        start=_to_iso(request_start),
+        end=_to_iso(request_end),
         symbols=symbols,
         schema=schema,
         split_duration=split_duration,
@@ -1077,6 +1428,24 @@ def is_bento_no_data_error(exc: Exception) -> bool:
         isinstance(exc, BentoClientError)
         and "data_no_data_found_for_request" in message
     )
+
+
+def is_retryable_definition_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retryable_fragments = (
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "gateway timed out",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(fragment in message for fragment in retryable_fragments)
 
 
 def run_post_definition_batch_request(request: dict) -> tuple[int, int, str, pd.DataFrame]:
@@ -1172,7 +1541,7 @@ def _schema_request_bounds(
 
     if schema == "statistics":
         start_ts -= OPEN_INTEREST_LOOKBACK
-    elif schema == "cbbo-1s":
+    elif schema == QUOTE_SCHEMA:
         start_ts -= QUOTE_LOOKBACK
     elif schema == "trades":
         start_ts -= TRADE_LOOKBACK
@@ -1181,10 +1550,15 @@ def _schema_request_bounds(
     if end_ts > end_cap:
         end_ts = end_cap
 
-    if start_ts >= end_ts:
+    bounds = clamp_request_to_floor(
+        start_ts,
+        end_ts,
+        label=f"{schema} {start_day.isoformat()}..{end_day.isoformat()}",
+    )
+    if bounds is None:
         return None
 
-    return start_ts, end_ts
+    return bounds
 
 
 def build_post_definition_requests(plans, end_batch) -> list[dict]:
@@ -1208,7 +1582,7 @@ def build_post_definition_requests(plans, end_batch) -> list[dict]:
         window_label = f"{start_day.isoformat()}..{end_day.isoformat()}"
 
         for chunk_idx, chunk in enumerate(chunk_list(window_symbols, MAX_SYMBOLS_PER_JOB), start=1):
-            for schema in ("cbbo-1s", "trades", "statistics"):
+            for schema in (QUOTE_SCHEMA, "trades", "statistics"):
                 bounds = _schema_request_bounds(schema, start_day, end_day, end_batch)
                 if bounds is None:
                     continue
@@ -1564,9 +1938,15 @@ def build_symbol_week_definition_requests(
             snapshot_day = min(trade_dates)
             start_ts, end_ts = _trade_day_bounds_utc(snapshot_day, snapshot_day)
             request_end = min(end_ts, end_cap)
-            if start_ts >= request_end:
+            bounds = clamp_request_to_floor(
+                start_ts,
+                request_end,
+                label=f"definition {symbol} exp={exp_date.isoformat()} snapshot={snapshot_day.isoformat()}",
+            )
+            if bounds is None:
                 skipped_reason_counts["window clipped at end boundary"] += len(trade_dates)
                 continue
+            request_start, request_end = bounds
 
             requests.append({
                 "symbol": symbol,
@@ -1574,7 +1954,7 @@ def build_symbol_week_definition_requests(
                 "expiration_date": exp_date,
                 "snapshot_day": snapshot_day,
                 "trade_dates": sorted(trade_dates),
-                "start": start_ts,
+                "start": request_start,
                 "end": request_end,
             })
 
@@ -1655,20 +2035,409 @@ def prepare_definition_snapshot_with_stats(
     return out, stats
 
 
+def _normalize_date_value(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return pd.Timestamp(value).date()
+
+
+def _to_db_timestamp(value):
+    ts = _to_utc_timestamp(value)
+    return ts.tz_localize(None).to_pydatetime()
+
+
+def _definition_request_cache_key(request: dict) -> tuple[str, date, date]:
+    return (
+        str(request["symbol"]),
+        _normalize_date_value(request["expiration_date"]),
+        _normalize_date_value(request["snapshot_day"]),
+    )
+
+
+def _dates_to_cache_text(dates: set[date]) -> str:
+    return json.dumps([d.isoformat() for d in sorted(dates)])
+
+
+def _cache_text_to_dates(value) -> set[date]:
+    if value in (None, ""):
+        return set()
+    try:
+        raw_values = json.loads(str(value))
+    except Exception:
+        return set()
+
+    out: set[date] = set()
+    for raw_value in raw_values:
+        try:
+            out.add(_normalize_date_value(raw_value))
+        except Exception:
+            continue
+    return out
+
+
+def _empty_definition_stats_from_cache(meta: dict) -> dict[str, object]:
+    return {
+        "raw_rows": int(meta.get("raw_rows") or 0),
+        "symbol_rows": int(meta.get("symbol_rows") or 0),
+        "expiration_rows": int(meta.get("expiration_rows") or 0),
+        "cp_rows": int(meta.get("cp_rows") or 0),
+        "valid_rows": int(meta.get("valid_rows") or 0),
+        "final_rows": int(meta.get("final_rows") or 0),
+        "symbol_expiration_dates": _cache_text_to_dates(meta.get("symbol_expiration_dates")),
+    }
+
+
+def load_cached_definition_requests(
+    requests: list[dict],
+) -> tuple[list[tuple[dict, pd.DataFrame, dict[str, object]]], list[dict]]:
+    if not DEFINITION_CACHE_ENABLED or not requests:
+        return [], requests
+
+    key_rows = [
+        {
+            "symbol": str(request["symbol"]),
+            "expiration_date": _normalize_date_value(request["expiration_date"]),
+            "snapshot_day": _normalize_date_value(request["snapshot_day"]),
+        }
+        for request in requests
+    ]
+    key_df = pd.DataFrame(key_rows).drop_duplicates()
+    request_by_key = {_definition_request_cache_key(request): request for request in requests}
+
+    con = duckdb.connect(DB_PATH)
+    try:
+        ensure_definition_cache_tables(con)
+        con.register("_definition_request_keys", key_df)
+        meta_rows = con.execute("""
+            SELECT
+                c.symbol,
+                c.parent,
+                c.expiration_date,
+                c.snapshot_day,
+                c.status,
+                c.error,
+                c.raw_rows,
+                c.symbol_rows,
+                c.expiration_rows,
+                c.cp_rows,
+                c.valid_rows,
+                c.final_rows,
+                c.symbol_expiration_dates
+            FROM historical_definition_request_cache AS c
+            INNER JOIN _definition_request_keys AS k
+              ON c.symbol = k.symbol
+             AND c.expiration_date = k.expiration_date
+             AND c.snapshot_day = k.snapshot_day
+            WHERE c.status IN ('OK', 'EMPTY')
+        """).fetchall()
+        con.unregister("_definition_request_keys")
+
+        meta_by_key = {}
+        for row in meta_rows:
+            key = (str(row[0]), _normalize_date_value(row[2]), _normalize_date_value(row[3]))
+            meta_by_key[key] = {
+                "symbol": row[0],
+                "parent": row[1],
+                "expiration_date": row[2],
+                "snapshot_day": row[3],
+                "status": row[4],
+                "error": row[5],
+                "raw_rows": row[6],
+                "symbol_rows": row[7],
+                "expiration_rows": row[8],
+                "cp_rows": row[9],
+                "valid_rows": row[10],
+                "final_rows": row[11],
+                "symbol_expiration_dates": row[12],
+            }
+
+        cached_keys = set(meta_by_key)
+        row_frames_by_key: dict[tuple[str, date, date], pd.DataFrame] = {}
+        if cached_keys:
+            cached_key_df = pd.DataFrame(
+                [
+                    {
+                        "symbol": key[0],
+                        "expiration_date": key[1],
+                        "snapshot_day": key[2],
+                    }
+                    for key in sorted(cached_keys)
+                ]
+            )
+            con.register("_cached_definition_keys", cached_key_df)
+            rows_df = con.execute("""
+                SELECT
+                    r.symbol,
+                    r.expiration_date,
+                    r.snapshot_day,
+                    r.ts_event,
+                    r.underlying,
+                    r.raw_symbol,
+                    r.instrument_class,
+                    r.strike_price,
+                    r.strike_f,
+                    r.exp_date,
+                    r.exp_ymd
+                FROM historical_definition_cache_rows AS r
+                INNER JOIN _cached_definition_keys AS k
+                  ON r.symbol = k.symbol
+                 AND r.expiration_date = k.expiration_date
+                 AND r.snapshot_day = k.snapshot_day
+                ORDER BY r.symbol, r.expiration_date, r.snapshot_day, r.ts_event, r.raw_symbol
+            """).fetchdf()
+            con.unregister("_cached_definition_keys")
+
+            if not rows_df.empty:
+                for (symbol, expiration_date, snapshot_day), group in rows_df.groupby(
+                    ["symbol", "expiration_date", "snapshot_day"],
+                    dropna=False,
+                ):
+                    key = (
+                        str(symbol),
+                        _normalize_date_value(expiration_date),
+                        _normalize_date_value(snapshot_day),
+                    )
+                    row_frames_by_key[key] = group[
+                        [
+                            "ts_event",
+                            "underlying",
+                            "raw_symbol",
+                            "instrument_class",
+                            "strike_price",
+                            "strike_f",
+                            "exp_date",
+                            "exp_ymd",
+                        ]
+                    ].copy()
+    finally:
+        con.close()
+
+    cached_results: list[tuple[dict, pd.DataFrame, dict[str, object]]] = []
+    uncached_requests: list[dict] = []
+    for request in requests:
+        key = _definition_request_cache_key(request)
+        meta = meta_by_key.get(key)
+        if meta is None:
+            uncached_requests.append(request)
+            continue
+        stats = _empty_definition_stats_from_cache(meta)
+        cached_results.append((request, row_frames_by_key.get(key, pd.DataFrame()), stats))
+
+    print(
+        f"[DEFS] cache hits={len(cached_results):,} "
+        f"misses={len(uncached_requests):,}"
+    )
+    return cached_results, uncached_requests
+
+
+def normalize_definition_cache_rows(
+    request: dict,
+    df_defs: pd.DataFrame,
+) -> pd.DataFrame:
+    if df_defs is None or df_defs.empty:
+        return pd.DataFrame()
+
+    out = df_defs.copy()
+    time_col = "ts_event" if "ts_event" in out.columns else ("timestamp" if "timestamp" in out.columns else None)
+    if time_col is None:
+        return pd.DataFrame()
+    if time_col != "ts_event":
+        out = out.rename(columns={time_col: "ts_event"})
+
+    out["symbol"] = str(request["symbol"])
+    out["expiration_date"] = _normalize_date_value(request["expiration_date"])
+    out["snapshot_day"] = _normalize_date_value(request["snapshot_day"])
+    out["ts_event"] = pd.to_datetime(out["ts_event"], utc=True, errors="coerce").dt.tz_localize(None)
+    out["strike_price"] = pd.to_numeric(out.get("strike_price"), errors="coerce")
+    out["strike_f"] = pd.to_numeric(out.get("strike_f"), errors="coerce")
+    out["exp_date"] = pd.to_datetime(out["exp_date"], errors="coerce").dt.date
+    out["exp_ymd"] = out["exp_ymd"].astype(str)
+    for col in ("underlying", "raw_symbol", "instrument_class"):
+        out[col] = out[col].astype(str)
+
+    return out[
+        [
+            "symbol",
+            "expiration_date",
+            "snapshot_day",
+            "ts_event",
+            "underlying",
+            "raw_symbol",
+            "instrument_class",
+            "strike_price",
+            "strike_f",
+            "exp_date",
+            "exp_ymd",
+        ]
+    ].dropna(subset=["raw_symbol", "strike_f", "exp_date"])
+
+
+def persist_definition_cache_entries(
+    entries: list[tuple[dict, pd.DataFrame, dict[str, object]]],
+) -> None:
+    if not DEFINITION_CACHE_ENABLED or not entries:
+        return
+
+    meta_rows = []
+    row_frames = []
+    key_rows = []
+    cached_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    for request, df_defs, stats in entries:
+        key_rows.append({
+            "symbol": str(request["symbol"]),
+            "expiration_date": _normalize_date_value(request["expiration_date"]),
+            "snapshot_day": _normalize_date_value(request["snapshot_day"]),
+        })
+        meta_rows.append([
+            str(request["symbol"]),
+            str(request["parent"]),
+            _normalize_date_value(request["expiration_date"]),
+            _normalize_date_value(request["snapshot_day"]),
+            _to_db_timestamp(request["start"]),
+            _to_db_timestamp(request["end"]),
+            "OK" if df_defs is not None and not df_defs.empty else "EMPTY",
+            None,
+            int(stats.get("raw_rows") or 0),
+            int(stats.get("symbol_rows") or 0),
+            int(stats.get("expiration_rows") or 0),
+            int(stats.get("cp_rows") or 0),
+            int(stats.get("valid_rows") or 0),
+            int(stats.get("final_rows") or 0),
+            _dates_to_cache_text(stats.get("symbol_expiration_dates", set())),
+            cached_at,
+        ])
+        rows_df = normalize_definition_cache_rows(request, df_defs)
+        if not rows_df.empty:
+            row_frames.append(rows_df)
+
+    con = duckdb.connect(DB_PATH)
+    try:
+        ensure_definition_cache_tables(con)
+        key_df = pd.DataFrame(key_rows).drop_duplicates()
+        con.register("_definition_cache_delete_keys", key_df)
+        con.execute("""
+            DELETE FROM historical_definition_request_cache
+            USING _definition_cache_delete_keys AS k
+            WHERE historical_definition_request_cache.symbol = k.symbol
+              AND historical_definition_request_cache.expiration_date = k.expiration_date
+              AND historical_definition_request_cache.snapshot_day = k.snapshot_day
+        """)
+        con.execute("""
+            DELETE FROM historical_definition_cache_rows
+            USING _definition_cache_delete_keys AS k
+            WHERE historical_definition_cache_rows.symbol = k.symbol
+              AND historical_definition_cache_rows.expiration_date = k.expiration_date
+              AND historical_definition_cache_rows.snapshot_day = k.snapshot_day
+        """)
+        con.unregister("_definition_cache_delete_keys")
+
+        con.executemany(
+            """
+            INSERT INTO historical_definition_request_cache (
+                symbol,
+                parent,
+                expiration_date,
+                snapshot_day,
+                request_start,
+                request_end,
+                status,
+                error,
+                raw_rows,
+                symbol_rows,
+                expiration_rows,
+                cp_rows,
+                valid_rows,
+                final_rows,
+                symbol_expiration_dates,
+                cached_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            meta_rows,
+        )
+
+        inserted_rows = 0
+        if row_frames:
+            rows_df = pd.concat(row_frames, ignore_index=True)
+            inserted_rows = len(rows_df)
+            con.register("_definition_cache_rows", rows_df)
+            con.execute("""
+                INSERT INTO historical_definition_cache_rows (
+                    symbol,
+                    expiration_date,
+                    snapshot_day,
+                    ts_event,
+                    underlying,
+                    raw_symbol,
+                    instrument_class,
+                    strike_price,
+                    strike_f,
+                    exp_date,
+                    exp_ymd
+                )
+                SELECT
+                    symbol,
+                    expiration_date,
+                    snapshot_day,
+                    ts_event,
+                    underlying,
+                    raw_symbol,
+                    instrument_class,
+                    strike_price,
+                    strike_f,
+                    exp_date,
+                    exp_ymd
+                FROM _definition_cache_rows
+            """)
+            con.unregister("_definition_cache_rows")
+    finally:
+        con.close()
+
+    print(
+        f"[DEFS] cache stored requests={len(meta_rows):,} "
+        f"rows={inserted_rows:,}"
+    )
+
+
 def run_definition_timeseries_request(request: dict) -> tuple[dict, pd.DataFrame, str | None]:
     ts_client = db.Historical(DATABENTO_API_KEY)
-    try:
-        df = ts_client.timeseries.get_range(
-            dataset="OPRA.PILLAR",
-            schema="definition",
-            symbols=[request["parent"]],
-            stype_in="parent",
-            start=request["start"],
-            end=request["end"],
-        ).to_df()
-        return request, df, None
-    except Exception as exc:
-        return request, pd.DataFrame(), str(exc)
+    last_error: Exception | None = None
+
+    for attempt in range(1, DEF_TS_REQUEST_MAX_ATTEMPTS + 1):
+        try:
+            bounds = clamp_request_to_floor(
+                request["start"],
+                request["end"],
+                label=f"definition timeseries {request['symbol']} exp={request['expiration_date'].isoformat()}",
+            )
+            if bounds is None:
+                return request, pd.DataFrame(), "window clipped by Databento request floor"
+            request_start, request_end = bounds
+            df = ts_client.timeseries.get_range(
+                dataset="OPRA.PILLAR",
+                schema="definition",
+                symbols=[request["parent"]],
+                stype_in="parent",
+                start=request_start,
+                end=request_end,
+            ).to_df()
+            return request, df, None
+        except Exception as exc:
+            last_error = exc
+            if attempt >= DEF_TS_REQUEST_MAX_ATTEMPTS or not is_retryable_definition_error(exc):
+                break
+
+            sleep_s = DEF_TS_REQUEST_RETRY_DELAY_S * (DEF_TS_REQUEST_RETRY_BACKOFF ** (attempt - 1))
+            print(
+                f"[RETRY] defs {request['symbol']} exp={request['expiration_date'].isoformat()} "
+                f"snapshot={request['snapshot_day'].isoformat()} attempt "
+                f"{attempt}/{DEF_TS_REQUEST_MAX_ATTEMPTS} failed: {exc} | retrying in {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+
+    return request, pd.DataFrame(), str(last_error) if last_error is not None else "unknown error"
 
 
 def run_definition_timeseries_requests(requests: list[dict]) -> list[tuple[dict, pd.DataFrame]]:
@@ -1811,8 +2580,13 @@ def create_raw_symbols_list(symbols: list[str], days_back: int = 35):
     )
 
     plans: dict[str, dict] = {}
-    definition_results = run_definition_timeseries_requests(definition_requests)
-    if not definition_results:
+    cached_definition_results: list[tuple[dict, pd.DataFrame, dict[str, object]]] = []
+    uncached_definition_requests = definition_requests
+    if DEFINITION_CACHE_ENABLED:
+        cached_definition_results, uncached_definition_requests = load_cached_definition_requests(definition_requests)
+
+    definition_results = run_definition_timeseries_requests(uncached_definition_requests)
+    if not definition_results and not cached_definition_results:
         persisted = persist_status_rows(planner_status_rows)
         if persisted:
             print(f"[STATUS] persisted {persisted:,} planner status row(s)")
@@ -1835,10 +2609,13 @@ def create_raw_symbols_list(symbols: list[str], days_back: int = 35):
             "final_rows": 0,
         }
     )
+    prepared_definition_results: list[tuple[dict, pd.DataFrame, dict[str, object]]] = list(cached_definition_results)
+    cache_entries: list[tuple[dict, pd.DataFrame, dict[str, object]]] = []
+
     processed_definition_results = 0
-    prepared_snapshots = 0
-    empty_prepared_snapshots = 0
-    prepared_rows = 0
+    fresh_prepared_snapshots = 0
+    fresh_empty_prepared_snapshots = 0
+    fresh_prepared_rows = 0
     for request, df_defs_raw in definition_results:
         processed_definition_results += 1
         df_defs, prep_stats = prepare_definition_snapshot_with_stats(
@@ -1846,6 +2623,33 @@ def create_raw_symbols_list(symbols: list[str], days_back: int = 35):
             symbol=request["symbol"],
             expiration_date=request["expiration_date"],
         )
+        prepared_definition_results.append((request, df_defs, prep_stats))
+        cache_entries.append((request, df_defs, prep_stats))
+
+        if df_defs.empty:
+            fresh_empty_prepared_snapshots += 1
+        else:
+            fresh_prepared_snapshots += 1
+            fresh_prepared_rows += len(df_defs)
+
+        if (
+            processed_definition_results % DEF_TS_PREPARE_PROGRESS_EVERY == 0
+            or processed_definition_results == len(definition_results)
+        ):
+            print(
+                f"[DEFS] prepare fresh {processed_definition_results}/{len(definition_results)} "
+                f"nonempty={fresh_prepared_snapshots} empty={fresh_empty_prepared_snapshots} "
+                f"rows={fresh_prepared_rows:,}"
+            )
+
+    persist_definition_cache_entries(cache_entries)
+
+    prepared_snapshots = 0
+    empty_prepared_snapshots = 0
+    prepared_rows = 0
+    processed_definition_results = 0
+    for request, df_defs, prep_stats in prepared_definition_results:
+        processed_definition_results += 1
         sym_stats = symbol_definition_stats[request["symbol"]]
         sym_stats["request_count"] += 1
         for key in ("raw_rows", "symbol_rows", "expiration_rows", "cp_rows", "valid_rows", "final_rows"):
@@ -1855,10 +2659,10 @@ def create_raw_symbols_list(symbols: list[str], days_back: int = 35):
             empty_prepared_snapshots += 1
             if (
                 processed_definition_results % DEF_TS_PREPARE_PROGRESS_EVERY == 0
-                or processed_definition_results == len(definition_results)
+                or processed_definition_results == len(prepared_definition_results)
             ):
                 print(
-                    f"[DEFS] prepare {processed_definition_results}/{len(definition_results)} "
+                    f"[DEFS] prepare total {processed_definition_results}/{len(prepared_definition_results)} "
                     f"nonempty={prepared_snapshots} empty={empty_prepared_snapshots} rows={prepared_rows:,}"
                 )
             continue
@@ -1867,16 +2671,16 @@ def create_raw_symbols_list(symbols: list[str], days_back: int = 35):
         prepared_rows += len(df_defs)
         if (
             processed_definition_results % DEF_TS_PREPARE_PROGRESS_EVERY == 0
-            or processed_definition_results == len(definition_results)
+            or processed_definition_results == len(prepared_definition_results)
         ):
             print(
-                f"[DEFS] prepare {processed_definition_results}/{len(definition_results)} "
+                f"[DEFS] prepare total {processed_definition_results}/{len(prepared_definition_results)} "
                 f"nonempty={prepared_snapshots} empty={empty_prepared_snapshots} rows={prepared_rows:,}"
             )
 
     print(
         f"[INFO] definition snapshots prepared: "
-        f"nonempty={prepared_snapshots:,}/{len(definition_requests):,} "
+        f"nonempty={prepared_snapshots:,}/{len(prepared_definition_results):,} "
         f"empty={empty_prepared_snapshots:,} rows={prepared_rows:,}"
     )
 
@@ -2065,11 +2869,11 @@ def get_data(raw_symbols_list, plans, days_back: int = 35):
         f"across {window_count} window(s) for {len(raw_symbols_list):,} raw symbol(s)"
     )
     print(
-        f"[DATA] job mix: cbbo-1s={schema_counts.get('cbbo-1s', 0)} "
+        f"[DATA] job mix: {QUOTE_SCHEMA}={schema_counts.get(QUOTE_SCHEMA, 0)} "
         f"trades={schema_counts.get('trades', 0)} statistics={schema_counts.get('statistics', 0)}"
     )
 
-    schema_order = {"cbbo-1s": 0, "trades": 1, "statistics": 2}
+    schema_order = {QUOTE_SCHEMA: 0, "trades": 1, "statistics": 2}
     results = run_post_definition_requests(requests)
 
     mkt_frames = []
@@ -2082,7 +2886,7 @@ def get_data(raw_symbols_list, plans, days_back: int = 35):
     ):
         df_chunk = prepare_batch_result(schema, df_chunk)
 
-        if schema == "cbbo-1s" and not df_chunk.empty:
+        if schema == QUOTE_SCHEMA and not df_chunk.empty:
             mkt_frames.append(df_chunk)
         elif schema == "trades" and not df_chunk.empty:
             trd_frames.append(df_chunk)
@@ -2141,61 +2945,27 @@ def get_data(raw_symbols_list, plans, days_back: int = 35):
 
                 exp_date, days_till_expiry, strike_sides = daily_legs
 
-                if days_till_expiry <= 1:
-                    time_decay_bucket = "EXTREME"
-                elif days_till_expiry <= 3:
-                    time_decay_bucket = "HIGH"
-                elif days_till_expiry <= 7:
-                    time_decay_bucket = "MEDIUM"
-                else:
-                    time_decay_bucket = "LOW"
-
-                out = get_contract_data_from_lookups_fast(
-                    strike_sides,
-                    days_till_expiry,
-                    def_map,
-                    exp_date,
-                    ts,
-                    underlying_price,
-                    mkt_lookup,
-                    trd_lookup,
-                    oi_lookup,
+                intraday_snapshot_rows, intraday_volume_rows = build_intraday_rows_for_day(
+                    parent_symbol=symbol,
+                    trade_date=trade_date,
+                    underlying_price=underlying_price,
+                    strike_sides=strike_sides,
+                    days_till_expiry=days_till_expiry,
+                    exp_date=exp_date,
+                    def_map=def_map,
+                    mkt_lookup=mkt_lookup,
+                    trd_lookup=trd_lookup,
                 )
 
-                snapshot_rows_for_day = 0
-                volume_rows_for_day = 0
-                for (strike, side) in strike_sides:
-                    bid, ask, mid, oi, vol, iv, spread, spread_pct = out.get(
-                        (strike, side), (None, None, None, None, 0.0, None, None, None)
-                    )
-
-                    if strike == strike_sides[0][0]:
-                        bucket = "ATM"
-                    elif strike in (strike_sides[2][0], strike_sides[3][0]):
-                        bucket = "OTM1"
-                    else:
-                        bucket = "OTM2"
-
-                    append_row(
-                        symbol_snapshot_results,
-                        ts, symbol, underlying_price, strike, side,
-                        days_till_expiry, exp_date, bucket, mid, iv,
-                        time_decay_bucket
-                    )
-                    append_volume_row(
-                        symbol_volume_results,
-                        ts, symbol, side, days_till_expiry, bucket, vol,
-                        time_decay_bucket
-                    )
-                    snapshot_rows_for_day += 1
-                    volume_rows_for_day += 1
+                symbol_snapshot_results.extend(intraday_snapshot_rows)
+                symbol_volume_results.extend(intraday_volume_rows)
 
                 append_status_row(
                     symbol_status_results,
                     symbol,
                     trade_date,
-                    snapshot_rows_for_day,
-                    volume_rows_for_day,
+                    len(intraday_snapshot_rows),
+                    len(intraday_volume_rows),
                     COMPLETE_STATUS,
                 )
 

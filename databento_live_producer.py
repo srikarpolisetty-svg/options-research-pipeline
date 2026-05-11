@@ -3,13 +3,16 @@
 import databento as db
 import datetime as dt
 from config import DATABENTO_API_KEY
-from statistics import mean
-from statistics import stdev
 import duckdb
 from confluent_kafka import Producer
 import json
 
 producer = Producer({"bootstrap.servers": "localhost:9092"})
+EVENT_LOG_INTERVAL = 5_000
+
+
+def debug(message: str) -> None:
+    print(f"[LIVE PRODUCER] {message}", flush=True)
 
 
 def to_event_timestamp(ts_event):
@@ -18,12 +21,8 @@ def to_event_timestamp(ts_event):
         tz=dt.timezone.utc,
     ).replace(tzinfo=None).isoformat()
 
-
-
-
-import duckdb
-
 con1 = duckdb.connect("rawsymbols.db", read_only=True)
+debug("opened rawsymbols.db read_only")
 
 
 symbols = con1.execute("""
@@ -42,9 +41,6 @@ for symbol in symbols:
         WHERE parent_symbol = ?
     """, [symbol]).fetchdf()
 
-    print(symbol)
-    print(df)
-
     subscribe_symbols_list.extend(df["raw_option_symbol"].tolist())
 
 
@@ -59,6 +55,7 @@ for symbol in symbols:
         })
 
 subscribe_symbols_list = list(dict.fromkeys(subscribe_symbols_list))
+debug(f"raw universe loaded parents={len(symbols)} raws={len(subscribe_symbols_list)}")
 
 
 con1.close()
@@ -69,6 +66,7 @@ symbol_list_event = {
 
 producer.produce("market-records", json.dumps(symbol_list_event).encode("utf-8"))
 producer.poll(0)
+debug("published symbols_list")
 
 
 
@@ -79,10 +77,12 @@ mapper_event = {
 
 producer.produce("market-records", json.dumps(mapper_event).encode("utf-8"))
 producer.poll(0)
+debug(f"published symbol_mapper raws={len(symbol_mapper)}")
 
 
 
 live = db.Live(key=DATABENTO_API_KEY)
+debug("databento live client ready")
 
 
 
@@ -93,6 +93,7 @@ live.subscribe(
     symbols=subscribe_symbols_list,
     stype_in="raw_symbol",
 )
+debug("subscribed quotes schema=cbbo-1m")
 
 live.subscribe(
     dataset="OPRA.PILLAR",
@@ -100,12 +101,19 @@ live.subscribe(
     symbols=subscribe_symbols_list,
     stype_in="raw_symbol",
 )
+debug("subscribed trades schema=trades")
 
 inst_to_raw = {}
+symbol_mappings = 0
+quote_events = 0
+volume_events = 0
 
 for rec in live:
     if rec.rtype == db.RType.SYMBOL_MAPPING:
         inst_to_raw[int(rec.instrument_id)] = str(rec.stype_in_symbol)
+        symbol_mappings += 1
+        if symbol_mappings == 1 or symbol_mappings % EVENT_LOG_INTERVAL == 0:
+            debug(f"symbol mappings={symbol_mappings}")
         continue
 
     if rec.rtype == db.RType.MBP_0:
@@ -123,6 +131,9 @@ for rec in live:
         }
         producer.produce("market-records", json.dumps(volume_event).encode("utf-8"))
         producer.poll(0)
+        volume_events += 1
+        if volume_events == 1 or volume_events % EVENT_LOG_INTERVAL == 0:
+            debug(f"volume events={volume_events} latest={raw_symbol} vol={trade_volume}")
 
 
 
@@ -159,3 +170,6 @@ for rec in live:
 
     producer.produce("market-records", json.dumps(quote_event).encode("utf-8"))
     producer.poll(0)
+    quote_events += 1
+    if quote_events == 1 or quote_events % EVENT_LOG_INTERVAL == 0:
+        debug(f"quote events={quote_events} latest={raw_symbol} mid={mid:.3f}")
