@@ -4,6 +4,12 @@ An end-to-end options-market research system for collecting OPRA option data, bu
 
 This project is a research and data-engineering system, not a production trading bot. The final result was intentionally honest: the z-score anomaly strategy found real option price expansions, but portfolio-level edge was not strong enough after realistic exits and misses. The engineering framework is the main artifact.
 
+## Demo Video
+
+[![Live Options Market Research System Demo](https://img.youtube.com/vi/iFoRqB5RXG8/maxresdefault.jpg)](https://youtu.be/iFoRqB5RXG8)
+
+Watch the project walkthrough: [Live Options Market Research System](https://youtu.be/iFoRqB5RXG8)
+
 ## What This Project Shows
 
 - Historical market-data engineering with Databento OPRA data, DuckDB storage, retry logic, batching, request guards, and cached definitions.
